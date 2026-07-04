@@ -1,0 +1,375 @@
+"use client";
+
+import { useMemo, useState } from "react";
+
+type RebalanceAction =
+  | "EMERGENCY_REPAY"
+  | "REPAY_DEBT"
+  | "BUY_COLLATERAL"
+  | "BORROW_MORE"
+  | "REFILL_CASH"
+  | "DEPLOY_EXCESS_CASH"
+  | "NO_ACTION";
+
+type RebalanceResult = {
+  action: RebalanceAction;
+  recommendation: string;
+  collateralUsd: number;
+  debtUsd: number;
+  cashUsd: number;
+  hf: number;
+  targetDebtUsd: number;
+  targetCollateralUsd: number;
+  targetCashUsd: number;
+  cashGapUsd: number;
+  amountUsd: number;
+};
+
+function computeCollateralUsd(priceUsd: number, quantity: number) {
+  return priceUsd * quantity;
+}
+
+function computeHf(collateralUsd: number, debtUsd: number, lt: number) {
+  if (debtUsd <= 0) return Number.POSITIVE_INFINITY;
+  return (collateralUsd * lt) / debtUsd;
+}
+
+function computeTargetDebtUsd(
+  collateralUsd: number,
+  liquidationThreshold: number,
+  hfTarget: number
+) {
+  return (collateralUsd * liquidationThreshold) / hfTarget;
+}
+
+function computeTargetCollateralUsd(
+  debtUsd: number,
+  liquidationThreshold: number,
+  hfTarget: number
+) {
+  return (debtUsd * hfTarget) / liquidationThreshold;
+}
+
+function computePatrimonyUsd(collateralUsd: number, cashUsd: number, debtUsd: number) {
+  return collateralUsd + cashUsd - debtUsd;
+}
+
+function computeTargetCashUsd(patrimonyUsd: number, ratio: number) {
+  return patrimonyUsd * ratio;
+}
+
+function decideRebalance(params: {
+  wbtcPriceUsd: number;
+  wbtcQuantity: number;
+  debtUsd: number;
+  cashUsd: number;
+  liquidationThreshold: number;
+  hfTarget?: number;
+  hfMin?: number;
+  hfMax?: number;
+  cashTargetRatio?: number;
+}): RebalanceResult {
+  const hfTarget = params.hfTarget ?? 2;
+  const hfMin = params.hfMin ?? 1.98;
+  const hfMax = params.hfMax ?? 2.2;
+  const cashTargetRatio = params.cashTargetRatio ?? 0.25;
+
+  const collateralUsd = computeCollateralUsd(params.wbtcPriceUsd, params.wbtcQuantity);
+  const hf = computeHf(collateralUsd, params.debtUsd, params.liquidationThreshold);
+  const patrimonyUsd = computePatrimonyUsd(collateralUsd, params.cashUsd, params.debtUsd);
+  const targetCashUsd = computeTargetCashUsd(patrimonyUsd, cashTargetRatio);
+  const cashGapUsd = targetCashUsd - params.cashUsd;
+
+  const targetDebtUsd = computeTargetDebtUsd(
+    collateralUsd,
+    params.liquidationThreshold,
+    hfTarget
+  );
+
+  const targetCollateralUsd = computeTargetCollateralUsd(
+    params.debtUsd,
+    params.liquidationThreshold,
+    hfTarget
+  );
+
+  if (hf < 1) {
+    return {
+      action: "EMERGENCY_REPAY",
+      recommendation: "Risco de liquidação. Repague a dívida imediatamente.",
+      collateralUsd,
+      debtUsd: params.debtUsd,
+      cashUsd: params.cashUsd,
+      hf,
+      targetDebtUsd,
+      targetCollateralUsd,
+      targetCashUsd,
+      cashGapUsd,
+      amountUsd: Math.max(0, params.debtUsd - targetDebtUsd),
+    };
+  }
+
+  if (hf < hfMin) {
+    if (params.cashUsd > 0) {
+      return {
+        action: "REPAY_DEBT",
+        recommendation: "Use o caixa para amortizar a dívida e voltar ao HF alvo.",
+        collateralUsd,
+        debtUsd: params.debtUsd,
+        cashUsd: params.cashUsd,
+        hf,
+        targetDebtUsd,
+        targetCollateralUsd,
+        targetCashUsd,
+        cashGapUsd,
+        amountUsd: Math.min(params.cashUsd, Math.max(0, params.debtUsd - targetDebtUsd)),
+      };
+    }
+
+    return {
+      action: "BUY_COLLATERAL",
+      recommendation: "Compre mais colateral para restaurar o HF alvo.",
+      collateralUsd,
+      debtUsd: params.debtUsd,
+      cashUsd: params.cashUsd,
+      hf,
+      targetDebtUsd,
+      targetCollateralUsd,
+      targetCashUsd,
+      cashGapUsd,
+      amountUsd: Math.max(0, targetCollateralUsd - collateralUsd),
+    };
+  }
+
+  if (hf > hfMax) {
+    return {
+      action: "BORROW_MORE",
+      recommendation: "Seu HF está acima da faixa. Pode pegar mais emprestado.",
+      collateralUsd,
+      debtUsd: params.debtUsd,
+      cashUsd: params.cashUsd,
+      hf,
+      targetDebtUsd,
+      targetCollateralUsd,
+      targetCashUsd,
+      cashGapUsd,
+      amountUsd: Math.max(0, targetDebtUsd - params.debtUsd),
+    };
+  }
+
+  if (cashGapUsd > 0) {
+    return {
+      action: "REFILL_CASH",
+      recommendation: "Seu caixa está abaixo de 25% do patrimônio.",
+      collateralUsd,
+      debtUsd: params.debtUsd,
+      cashUsd: params.cashUsd,
+      hf,
+      targetDebtUsd,
+      targetCollateralUsd,
+      targetCashUsd,
+      cashGapUsd,
+      amountUsd: cashGapUsd,
+    };
+  }
+
+  if (cashGapUsd < 0) {
+    return {
+      action: "DEPLOY_EXCESS_CASH",
+      recommendation: "Há caixa excedente. Pode usar para amortizar dívida ou comprar colateral.",
+      collateralUsd,
+      debtUsd: params.debtUsd,
+      cashUsd: params.cashUsd,
+      hf,
+      targetDebtUsd,
+      targetCollateralUsd,
+      targetCashUsd,
+      cashGapUsd,
+      amountUsd: Math.abs(cashGapUsd),
+    };
+  }
+
+  return {
+    action: "NO_ACTION",
+    recommendation: "Posição dentro da faixa. Nenhuma ação necessária.",
+    collateralUsd,
+    debtUsd: params.debtUsd,
+    cashUsd: params.cashUsd,
+    hf,
+    targetDebtUsd,
+    targetCollateralUsd,
+    targetCashUsd,
+    cashGapUsd,
+    amountUsd: 0,
+  };
+}
+
+function Stat({
+  label,
+  value,
+  helper,
+}: {
+  label: string;
+  value: string;
+  helper?: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="text-sm text-slate-500">{label}</div>
+      <div className="mt-2 text-2xl font-semibold text-slate-900">{value}</div>
+      {helper ? <div className="mt-1 text-sm text-slate-600">{helper}</div> : null}
+    </div>
+  );
+}
+
+export default function Page() {
+  const [wbtcPriceUsd, setWbtcPriceUsd] = useState(65000);
+  const [wbtcQuantity, setWbtcQuantity] = useState(0.4923076923);
+  const [debtUsd, setDebtUsd] = useState(12000);
+  const [cashUsd, setCashUsd] = useState(5000);
+  const [liquidationThreshold, setLiquidationThreshold] = useState(0.75);
+  const [monthlyContributionUsd, setMonthlyContributionUsd] = useState(1000);
+  const [simulatedChangePct, setSimulatedChangePct] = useState(-10);
+
+  const currentResult = useMemo(
+    () =>
+      decideRebalance({
+        wbtcPriceUsd,
+        wbtcQuantity,
+        debtUsd,
+        cashUsd,
+        liquidationThreshold,
+        hfTarget: 2,
+        hfMin: 1.98,
+        hfMax: 2.2,
+        cashTargetRatio: 0.25,
+      }),
+    [wbtcPriceUsd, wbtcQuantity, debtUsd, cashUsd, liquidationThreshold]
+  );
+
+  const simulatedPriceUsd = wbtcPriceUsd * (1 + simulatedChangePct / 100);
+
+  const simulatedResult = useMemo(
+    () =>
+      decideRebalance({
+        wbtcPriceUsd: simulatedPriceUsd,
+        wbtcQuantity,
+        debtUsd,
+        cashUsd,
+        liquidationThreshold,
+        hfTarget: 2,
+        hfMin: 1.98,
+        hfMax: 2.2,
+        cashTargetRatio: 0.25,
+      }),
+    [simulatedPriceUsd, wbtcQuantity, debtUsd, cashUsd, liquidationThreshold]
+  );
+
+  return (
+    <main className="min-h-screen bg-slate-100 p-4 text-slate-900">
+      <div className="mx-auto max-w-6xl space-y-6">
+        <section className="rounded-3xl bg-slate-950 p-6 text-white shadow-sm">
+          <h1 className="text-3xl font-semibold">Monitor de Colateral e HF</h1>
+          <p className="mt-2 max-w-2xl text-slate-300">
+            App pessoal para acompanhar WBTC, dívida, caixa e rebalanceamento automático.
+          </p>
+        </section>
+
+        <section className="grid gap-4 rounded-3xl bg-white p-6 shadow-sm md:grid-cols-2 xl:grid-cols-3">
+          <Field label="Preço do WBTC" value={wbtcPriceUsd} onChange={setWbtcPriceUsd} step="100" />
+          <Field
+            label="Quantidade de WBTC"
+            value={wbtcQuantity}
+            onChange={setWbtcQuantity}
+            step="0.0001"
+          />
+          <Field label="Dívida (USD)" value={debtUsd} onChange={setDebtUsd} step="100" />
+          <Field label="Caixa (USD)" value={cashUsd} onChange={setCashUsd} step="100" />
+          <Field
+            label="Liquidation Threshold"
+            value={liquidationThreshold}
+            onChange={setLiquidationThreshold}
+            step="0.01"
+          />
+          <Field
+            label="Aporte mensal (USD)"
+            value={monthlyContributionUsd}
+            onChange={setMonthlyContributionUsd}
+            step="100"
+          />
+        </section>
+
+        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <Stat
+            label="Health Factor"
+            value={currentResult.hf === Infinity ? "∞" : currentResult.hf.toFixed(2)}
+            helper="Meta: 2.00 | Faixa: 1.98–2.20"
+          />
+          <Stat label="Colateral" value={`$${currentResult.collateralUsd.toFixed(2)}`} />
+          <Stat label="Dívida" value={`$${currentResult.debtUsd.toFixed(2)}`} />
+          <Stat label="Caixa" value={`$${currentResult.cashUsd.toFixed(2)}`} />
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <h2 className="text-xl font-semibold">Próxima ação</h2>
+          <p className="mt-2 text-slate-700">{currentResult.recommendation}</p>
+          <div className="mt-4 text-2xl font-semibold">
+            ${currentResult.amountUsd.toFixed(2)}
+          </div>
+          <div className="mt-1 text-sm text-slate-500">Ação: {currentResult.action}</div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <h2 className="text-xl font-semibold">Simulador de preço</h2>
+          <p className="mt-2 text-slate-600">Simule quedas ou altas do WBTC.</p>
+
+          <input
+            type="range"
+            min={-80}
+            max={80}
+            step={1}
+            value={simulatedChangePct}
+            onChange={(e) => setSimulatedChangePct(Number(e.target.value))}
+            className="mt-6 w-full"
+          />
+
+          <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <Stat label="Variação" value={`${simulatedChangePct >= 0 ? "+" : ""}${simulatedChangePct}%`} />
+            <Stat label="Preço simulado" value={`$${simulatedPriceUsd.toFixed(2)}`} />
+            <Stat
+              label="HF simulado"
+              value={simulatedResult.hf === Infinity ? "∞" : simulatedResult.hf.toFixed(2)}
+            />
+            <Stat label="Ação simulada" value={simulatedResult.action} />
+          </div>
+
+          <p className="mt-4 text-slate-700">{simulatedResult.recommendation}</p>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  step,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  step: string;
+}) {
+  return (
+    <label className="flex flex-col gap-2">
+      <span className="text-sm font-medium text-slate-700">{label}</span>
+      <input
+        type="number"
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="rounded-xl border border-slate-300 bg-white px-4 py-3 outline-none focus:border-slate-500"
+      />
+    </label>
+  );
+}
